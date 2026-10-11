@@ -2,6 +2,8 @@ package com.github.paicoding.forum.core.util;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.paicoding.forum.core.config.ImageProperties;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.CharUtils;
 import org.apache.commons.lang3.math.NumberUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -14,17 +16,20 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author YiHui
  * @date 2024/12/5
  */
+@Slf4j
 public class StrUtil {
     private static final String IMAGE_DIMENSION_CACHE_VERSION = "text-size-v12:";
     private static final Cache<String, ImageDimension> IMAGE_DIMENSION_CACHE = Caffeine.newBuilder()
@@ -61,6 +66,26 @@ public class StrUtil {
     private static final int PORTRAIT_IMAGE_MAX_SOURCE_WIDTH = 1200;
     private static final int PORTRAIT_IMAGE_MIN_RENDER_WIDTH = 400;
     private static final int PORTRAIT_IMAGE_MAX_RENDER_WIDTH = 560;
+
+    /**
+     * 正文内联图片下发的最大宽度。正文容器实测 736px，2x 高清屏取 1400 已有富余；
+     * 原图多是 4000px 宽的 retina 截图，多出来的像素浏览器渲染时会直接丢弃。
+     */
+    private static final int INLINE_IMAGE_WIDTH = 1400;
+    /**
+     * 点击放大（Fancybox）时下发的宽度，比内联版清晰但仍远小于原图。
+     */
+    private static final int ZOOM_IMAGE_WIDTH = 2400;
+    /**
+     * 动图转 WebP 会丢动画，矢量图本身就很小，两者都不交给 OSS 处理。
+     */
+    private static final String[] IMAGE_PROCESS_SKIP_SUFFIXES = {".gif", ".svg"};
+    /**
+     * 图片处理只对自家 OSS 桶的域名生效，所以取 {@code image.oss.host} 而不是 {@code image.cdn-host}——
+     * 后者被动态配置覆盖成了 cdn.tobebetterjavaer.com，那个域名不支持 OSS 图片处理参数。
+     */
+    private static final String IMAGE_OSS_HOST_CONFIG_KEY = "image.oss.host";
+    private static final AtomicBoolean OSS_HOST_MISSING_WARNED = new AtomicBoolean(false);
 
     /**
      * 微信支付的提示信息，不支持表情包，因此我们只保留中文 + 数字 + 英文字母 + 符号 '《》【】-_.'
@@ -182,6 +207,7 @@ public class StrUtil {
 
         try {
             ImageDimensionStore store = resolveImageDimensionStore();
+            String ossHost = resolveOssHost();
             org.jsoup.nodes.Document doc = org.jsoup.Jsoup.parseBodyFragment(html);
             org.jsoup.select.Elements images = doc.select("img");
             int imageIndex = 0;
@@ -189,6 +215,9 @@ public class StrUtil {
                 stabilizeImageLoadingAttrs(img, imageIndex++);
 
                 String src = normalizeImageSrc(img.attr("src"));
+                // 注意：src 变量始终保持原图地址，宽高探测与 image_dimension 表都以它为键
+                applyCdnImageProcess(img, src, ossHost);
+
                 ImageDimension dimension = null;
                 if (StringUtils.isNotBlank(src)) {
                     String cacheKey = buildImageDimensionCacheKey(src);
@@ -329,6 +358,114 @@ public class StrUtil {
             normalizedStyle += ";";
         }
         img.attr("style", normalizedStyle + " " + style + ";");
+    }
+
+    /**
+     * 只重写正文图片地址，不改动任何布局属性。
+     *
+     * <p>给小程序这类自带排版逻辑的渲染端用：它们的容器样式不受站点 CSS 约束，
+     * 写入原图宽高（动辄 3872px）反而可能撑破布局；但图片体积的问题是共通的——
+     * 小程序侧同样在下发单张 6~8MB 的原图。</p>
+     */
+    public static String compressHtmlImages(String html) {
+        return compressHtmlImages(html, resolveOssHost());
+    }
+
+    static String compressHtmlImages(String html, String ossHost) {
+        if (StringUtils.isBlank(html) || StringUtils.isBlank(ossHost)) {
+            return html;
+        }
+
+        try {
+            org.jsoup.nodes.Document doc = org.jsoup.Jsoup.parseBodyFragment(html);
+            for (org.jsoup.nodes.Element img : doc.select("img")) {
+                String processed = buildProcessedImageUrl(normalizeImageSrc(img.attr("src")), ossHost, INLINE_IMAGE_WIDTH);
+                if (processed != null) {
+                    img.attr("src", processed);
+                }
+            }
+            return doc.body().html();
+        } catch (Exception e) {
+            return html;
+        }
+    }
+
+    /**
+     * 正文图片交给阿里云 OSS 做缩放和格式转换。
+     *
+     * <p>原图多是 4000px 宽的未压缩 retina 截图，单张 6~8MB，而正文容器只有 736px——
+     * 多下发的像素在浏览器端直接被丢弃。实测单篇文章的图片总量可以从 62MB 降到 2MB，
+     * 其中约八成的节省来自"不再下发看不见的像素"，与画质无关。</p>
+     *
+     * <p>宽高属性仍写原图数值：等比缩放不改变宽高比，占位盒子依然正确，CLS 不受影响。</p>
+     */
+    static void applyCdnImageProcess(org.jsoup.nodes.Element img, String src, String ossHost) {
+        String inline = buildProcessedImageUrl(src, ossHost, INLINE_IMAGE_WIDTH);
+        if (inline == null) {
+            return;
+        }
+
+        img.attr("src", inline);
+        // Fancybox 绑定在 img 上，默认拿 src 当放大源；用 data-src 给它更清晰的一份
+        img.attr("data-src", buildProcessedImageUrl(src, ossHost, ZOOM_IMAGE_WIDTH));
+    }
+
+    /**
+     * 拼接 OSS 图片处理地址，不适用时返回 null。
+     *
+     * @param src     已规范化的图片地址
+     * @param ossHost 自家 OSS 桶的访问前缀，只处理这个域名下的图片，其余原样保留
+     * @param width   下发的最大宽度，OSS 只缩不放，小图不受影响
+     */
+    static String buildProcessedImageUrl(String src, String ossHost, int width) {
+        if (StringUtils.isBlank(src) || StringUtils.isBlank(ossHost)) {
+            return null;
+        }
+        if (!StringUtils.startsWithIgnoreCase(src, ossHost)) {
+            return null;
+        }
+        // 已带参数的地址可能是签名 URL 或已处理过，不重复追加
+        if (src.indexOf('?') >= 0) {
+            return null;
+        }
+        String lower = src.toLowerCase(Locale.ROOT);
+        for (String suffix : IMAGE_PROCESS_SKIP_SUFFIXES) {
+            if (lower.endsWith(suffix)) {
+                return null;
+            }
+        }
+        return src + "?x-oss-process=image/resize,w_" + width + "/format,webp";
+    }
+
+    /**
+     * 取自家 OSS 桶的访问域名。优先直接读配置——{@code SpringUtil.getConfig} 走 Environment，
+     * 能拿到数据库动态配置的最终值；bean 只作兜底。
+     *
+     * <p>两条路都拿不到时打一次 WARN：图片压缩会整体失效，而这种失效本身是静默的，
+     * 没有日志就只能靠肉眼看页面才发现。</p>
+     */
+    private static String resolveOssHost() {
+        String fromConfig = StringUtils.trimToNull(SpringUtil.getConfig(IMAGE_OSS_HOST_CONFIG_KEY));
+        if (fromConfig != null) {
+            return fromConfig;
+        }
+
+        try {
+            ImageProperties properties = SpringUtil.getBeanOrNull(ImageProperties.class);
+            String fromBean = properties == null || properties.getOss() == null
+                    ? null
+                    : StringUtils.trimToNull(properties.getOss().getHost());
+            if (fromBean != null) {
+                return fromBean;
+            }
+        } catch (Exception e) {
+            log.warn("resolve ImageProperties bean failed", e);
+        }
+
+        if (OSS_HOST_MISSING_WARNED.compareAndSet(false, true)) {
+            log.warn("未能解析 {}，正文图片将不做 OSS 压缩，按原图下发", IMAGE_OSS_HOST_CONFIG_KEY);
+        }
+        return null;
     }
 
     private static String normalizeImageSrc(String src) {

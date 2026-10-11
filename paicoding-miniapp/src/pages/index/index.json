@@ -1,8 +1,0 @@
-{
-  "navigationBarTitleText": "技术派文章",
-  "navigationStyle": "custom",
-  "usingComponents": {
-    "t-image": "tdesign-miniprogram/image/image",
-    "t-input": "tdesign-miniprogram/input/input"
-  }
-}

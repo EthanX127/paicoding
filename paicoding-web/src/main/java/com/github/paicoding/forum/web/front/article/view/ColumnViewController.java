@@ -27,6 +27,7 @@ import com.github.paicoding.forum.service.comment.service.CommentReadService;
 import com.github.paicoding.forum.service.sidebar.service.SidebarService;
 import com.github.paicoding.forum.service.user.service.UserFootService;
 import com.github.paicoding.forum.web.config.GlobalViewConfig;
+import com.github.paicoding.forum.web.error.ErrorViewFactory;
 import com.github.paicoding.forum.web.front.article.vo.ColumnVo;
 import com.github.paicoding.forum.web.global.GlobalInitService;
 import com.github.paicoding.forum.web.global.SeoInjectService;
@@ -78,6 +79,8 @@ public class ColumnViewController {
     private ArticlePayService articlePayService;
     @Autowired
     private UserFootService userFootService;
+    @Autowired
+    private ErrorViewFactory errorViewFactory;
 
     private static final long COLUMN_HOME_PAGE_SIZE = 100L;
     /**
@@ -120,7 +123,7 @@ public class ColumnViewController {
     public ModelAndView columnByRootSlug(String columnKey, Model model) {
         ColumnDTO column = columnService.queryColumnInfo(columnKey);
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
         return new ModelAndView(permanentRedirect(buildColumnRootUrl(column)));
     }
@@ -135,7 +138,7 @@ public class ColumnViewController {
     public ModelAndView columnReadmeByRootSlug(String columnKey, Model model) {
         ColumnDTO column = columnService.queryColumnInfo(columnKey);
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
         return new ModelAndView(permanentRedirect(buildColumnRootUrl(column)));
     }
@@ -155,7 +158,7 @@ public class ColumnViewController {
         if (section <= 0) section = 1;
         ColumnDTO column = columnService.queryBasicColumnInfo(columnKey);
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
 
         ColumnArticleDO columnArticle = columnService.queryColumnArticle(column.getColumnId(), section);
@@ -198,7 +201,7 @@ public class ColumnViewController {
                                            Model model) {
         ColumnDTO column = columnService.queryBasicColumnInfo(columnKey);
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
 
         ColumnArticleDO columnArticle = columnService.queryColumnArticle(column.getColumnId(), articleId);
@@ -217,7 +220,7 @@ public class ColumnViewController {
     public ModelAndView articleByArticleSlug(String columnSlug, String articleSlug, Model model) {
         ColumnDTO column = columnService.queryBasicColumnInfo(columnSlug);
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
 
         ColumnArticleDO columnArticle = columnService.queryColumnArticle(column.getColumnId(), articleSlug);
@@ -238,11 +241,11 @@ public class ColumnViewController {
     public ModelAndView articleByRootArticleSlug(Long articleId, Model model) {
         ColumnArticleDO columnArticle = columnService.getColumnArticleRelation(articleId);
         if (columnArticle == null) {
-            return new ModelAndView("error/404");
+            return errorViewFactory.notFound();
         }
         ColumnDTO column = columnService.queryBasicColumnInfo(columnArticle.getColumnId());
         if (isColumnForbidden(column, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
 
         ArticleDTO articleDTO = articleReadService.queryFullArticleInfo(articleId, ReqInfoContext.getReqInfo().getUserId());
@@ -252,7 +255,7 @@ public class ColumnViewController {
     private ModelAndView columnLanding(String columnKey, Model model) {
         ColumnDTO dto = columnService.queryColumnInfo(columnKey);
         if (isColumnForbidden(dto, model)) {
-            return new ModelAndView("views/error/403");
+            return errorViewFactory.forbidden();
         }
 
         List<SimpleArticleDTO> articles = columnService.queryColumnArticles(dto.getColumnId());
@@ -313,12 +316,7 @@ public class ColumnViewController {
                 return StrUtil.stabilizeHtmlImages(MarkdownConverter.markdownToHtml(introMarkdown));
             }
         }
-
-        if (StringUtils.isNotBlank(column.getIntroduction())) {
-            return MarkdownConverter.markdownToHtml(column.getIntroduction());
-        }
-
-        return "<p>这套教程围绕真实项目展开，覆盖项目背景、业务拆解、架构设计、核心技术实现、部署运行、简历写法和面试复盘。适合想用真实项目补齐工程经验、AI 应用经验和面试表达的同学系统学习。</p>";
+        return "";
     }
 
     private String normalizeReadmeMarkdown(String markdown) {
